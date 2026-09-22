@@ -38,11 +38,18 @@ Utils::ReadResult Utils::readFileAsBytes(const std::string &filePath) {
 
 Utils::ReadResult Utils::readFileAsBytes(const int fileDescriptor) {
     FILE* file = fdopen(fileDescriptor, "r");
+    if (file == nullptr) {
+        close(fileDescriptor);
+        return ReadResult { 0, nullptr };
+    }
     size_t size = getFileSize(file);
 
     char* bytes = new char[size];
     fread(bytes, sizeof(char), size, file);
-    close(fileDescriptor);
+    // fdopen() transfers ownership of the descriptor to FILE*. Closing the
+    // raw descriptor here races with the later FILE* cleanup and triggers
+    // Android fdsan on physical ARM devices. fclose() releases both safely.
+    fclose(file);
     return ReadResult { size, bytes };
 }
 

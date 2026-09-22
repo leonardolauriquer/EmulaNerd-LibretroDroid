@@ -20,6 +20,7 @@ package com.swordfish.libretrodroid
 import android.app.ActivityManager
 import android.content.Context
 import android.opengl.GLSurfaceView
+import android.os.Build
 import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -55,6 +56,11 @@ class GLRetroView(
         LibretroDroid.setFrameSpeed(value)
     }
 
+    // Native touch controls use this for slow motion. Keeping the pacing in
+    // the renderer avoids pretending that frameSpeed=0 is a valid mode.
+    var slowMotion: Boolean = false
+    private var slowFrameToggle = false
+
     var shader: ShaderConfig by Delegates.observable(data.shader) { _, _, value ->
         LibretroDroid.setShaderConfig(buildShader(value))
     }
@@ -74,14 +80,27 @@ class GLRetroView(
 
     init {
         openGLESVersion = getGLESVersion(context)
+        Log.i(TAG_LOG, "Libretro requested GLES $openGLESVersion (abi=${Build.SUPPORTED_ABIS?.joinToString()})")
         preserveEGLContextOnPause = true
         setEGLContextClientVersion(openGLESVersion)
+        // Some Android virtualized SurfaceView implementations reject the
+        // buffer after AspectRatioGLSurfaceView resizes itself from the full
+        // display to the core's native aspect ratio. Keep the surface at the
+        // display size there; the renderer already letterboxes the texture.
+        if (isLegacyVirtualizedRenderer()) {
+            setResizeMode(AspectRatioGLSurfaceView.RESIZE_MODE_FILL)
+        }
         setRenderer(Renderer())
+        // The native core must advance continuously. Relying on the
+        // GLSurfaceView default is fragile on some virtualized Android
+        // renderers and can leave audio initialized while no frames run.
+        renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         keepScreenOn = true
     }
 
     @OnLifecycleEvent(Lifecycle.Event.ON_CREATE)
     fun onCreate(lifecycleOwner: LifecycleOwner) = catchExceptions {
+        Log.i(TAG_LOG, "Libretro lifecycle ON_CREATE")
         lifecycle = lifecycleOwner.lifecycle
         LibretroDroid.create(
             openGLESVersion,
@@ -101,6 +120,7 @@ class GLRetroView(
 
     @OnLifecycleEvent(Lifecycle.Event.ON_DESTROY)
     fun onDestroy() = catchExceptions {
+        Log.i(TAG_LOG, "Libretro lifecycle ON_DESTROY")
         LibretroDroid.destroy()
         lifecycle = null
     }
@@ -200,8 +220,24 @@ class GLRetroView(
     fun changeDisk(index: Int) = runOnGLThread { LibretroDroid.changeDisk(index) }
 
     private fun getGLESVersion(context: Context): Int {
+        // BlueStacks exposes a GLES 3.2 context even on its Android 9 image.
+        // Use the ES3 image path there as well: it uploads each frame with the
+        // native RGB565 texture format instead of the legacy ES2 row fallback.
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         return if (activityManager.deviceConfigurationInfo.reqGlEsVersion >= 0x30000) { 3 } else { 2 }
+    }
+
+    private fun isLegacyVirtualizedRenderer(): Boolean {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) return false
+        val x86_64 = Build.SUPPORTED_ABIS?.any { it.equals("x86_64", ignoreCase = true) } == true
+        if (!x86_64) return false
+        val fingerprint = (Build.FINGERPRINT ?: "").lowercase(Locale.US)
+        val hardware = (Build.HARDWARE ?: "").lowercase(Locale.US)
+        return fingerprint.contains("p3sxxx") ||
+            fingerprint.contains("generic") ||
+            fingerprint.contains("emulator") ||
+            hardware.contains("goldfish") ||
+            hardware.contains("ranchu")
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -259,6 +295,7 @@ class GLRetroView(
     private inner class RenderLifecycleObserver : LifecycleObserver {
         @OnLifecycleEvent(Lifecycle.Event.ON_RESUME)
         private fun resume() = catchExceptions {
+            Log.i(TAG_LOG, "Libretro lifecycle RESUME")
             LibretroDroid.resume()
             onResume()
             refreshAspectRatio()
@@ -274,9 +311,17 @@ class GLRetroView(
     }
 
     inner class Renderer : GLSurfaceView.Renderer {
+        private var drawLogCount = 0
+
         override fun onDrawFrame(gl: GL10) = catchExceptions {
+            if (drawLogCount < 3) Log.i(TAG_LOG, "Libretro draw frame #${++drawLogCount} ready=$isEmulationReady")
             if (isEmulationReady) {
-                LibretroDroid.step(this@GLRetroView)
+                if (!slowMotion) {
+                    LibretroDroid.step(this@GLRetroView)
+                } else {
+                    slowFrameToggle = !slowFrameToggle
+                    if (slowFrameToggle) LibretroDroid.step(this@GLRetroView)
+                }
                 lifecycle?.coroutineScope?.launch {
                     retroGLEventsSubject.emit(GLRetroEvents.FrameRendered)
                 }
@@ -284,12 +329,14 @@ class GLRetroView(
         }
 
         override fun onSurfaceChanged(gl: GL10, width: Int, height: Int) = catchExceptions {
+            Log.i(TAG_LOG, "Libretro surface changed ${width}x${height}")
             Thread.currentThread().priority = Thread.MAX_PRIORITY
             LibretroDroid.onSurfaceChanged(width, height)
         }
 
 
         override fun onSurfaceCreated(gl: GL10, config: EGLConfig) = catchExceptions {
+            Log.i(TAG_LOG, "Libretro surface created")
             Thread.currentThread().priority = Thread.MAX_PRIORITY
             initializeCore()
             lifecycle?.coroutineScope?.launch {
@@ -300,12 +347,14 @@ class GLRetroView(
 
     private fun refreshAspectRatio() {
         val aspectRatio = LibretroDroid.getAspectRatio()
+        if (isLegacyVirtualizedRenderer()) return
         KtUtils.runOnUIThread { setAspectRatio(aspectRatio) }
     }
 
     // These functions are called from the GL thread.
     private fun initializeCore() = catchExceptions {
         if (isGameLoaded) return@catchExceptions
+        Log.i(TAG_LOG, "Libretro core initialization started")
         when {
             data.gameFilePath != null -> loadGameFromPath(data.gameFilePath!!)
             data.gameFileBytes != null -> loadGameFromBytes(data.gameFileBytes!!)
@@ -317,6 +366,7 @@ class GLRetroView(
         }
         LibretroDroid.onSurfaceCreated()
         isGameLoaded = true
+        Log.i(TAG_LOG, "Libretro core initialization complete")
 
         KtUtils.runOnUIThread {
             lifecycle?.addObserver(RenderLifecycleObserver())
@@ -342,6 +392,7 @@ class GLRetroView(
             if (isAborted) return
             block()
         } catch (e: RetroException) {
+            Log.e(TAG_LOG, "Libretro error code=${e.errorCode}", e)
             GlobalScope.launch {
                 retroGLIssuesErrors.emit(e.errorCode)
             }

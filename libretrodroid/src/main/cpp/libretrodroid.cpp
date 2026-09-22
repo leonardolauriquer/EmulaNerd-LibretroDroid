@@ -23,6 +23,8 @@
 #include <utility>
 #include <vector>
 #include <unordered_set>
+#include <cstdio>
+#include <cerrno>
 
 #include "libretrodroid.h"
 #include "utils/libretrodroidexception.h"
@@ -167,9 +169,18 @@ JNIEXPORT jboolean JNICALL LibretroDroid::unserializeSRAM(int8_t* data, size_t s
 }
 
 std::pair<int8_t*, size_t> LibretroDroid::serializeSRAM() {
+    if (core == nullptr) {
+        throw std::runtime_error("Cannot serialize SRAM before core initialization");
+    }
+
     size_t size = core->retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    void* sramState = core->retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    if (size == 0 || sramState == nullptr) {
+        return std::pair<int8_t*, size_t>(nullptr, 0);
+    }
+
     auto* data = new int8_t[size];
-    memcpy(data, (int8_t*) core->retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), size);
+    memcpy(data, (int8_t*) sramState, size);
 
     return std::pair(data, size);
 }
@@ -297,6 +308,19 @@ void LibretroDroid::loadGameFromPath(const std::string& gamePath) {
     LOGD("Performing libretrodroid loadGameFromPath");
     struct retro_system_info system_info {};
     core->retro_get_system_info(&system_info);
+    LOGI("Loading game path: %s (core=%s need_fullpath=%d)",
+         gamePath.c_str(),
+         system_info.library_name == nullptr ? "unknown" : system_info.library_name,
+         system_info.need_fullpath ? 1 : 0);
+    FILE* probe = std::fopen(gamePath.c_str(), "rb");
+    if (probe != nullptr) {
+        std::fseek(probe, 0, SEEK_END);
+        const long probeSize = std::ftell(probe);
+        std::fclose(probe);
+        LOGI("Game path probe succeeded: size=%ld path=%s", probeSize, gamePath.c_str());
+    } else {
+        LOGE("Game path probe failed: errno=%d path=%s", errno, gamePath.c_str());
+    }
 
     struct retro_game_info game_info {};
     game_info.path = Utils::cloneToCString(gamePath);
@@ -309,9 +333,11 @@ void LibretroDroid::loadGameFromPath(const std::string& gamePath) {
         struct Utils::ReadResult file = Utils::readFileAsBytes(gamePath);
         game_info.data = file.data;
         game_info.size = file.size;
+        LOGI("Loaded game bytes: size=%zu path=%s", game_info.size, gamePath.c_str());
     }
 
     bool result = core->retro_load_game(&game_info);
+    LOGI("retro_load_game result=%d path=%s", result ? 1 : 0, gamePath.c_str());
     if (!result) {
         LOGE("Cannot load game. Leaving.");
         throw std::runtime_error("Cannot load game");

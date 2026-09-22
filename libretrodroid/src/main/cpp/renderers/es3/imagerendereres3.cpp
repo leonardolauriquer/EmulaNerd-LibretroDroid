@@ -17,6 +17,7 @@
 
 #include "imagerendereres3.h"
 #include "../../libretro-common/include/libretro.h"
+#include "../../log.h"
 
 namespace libretrodroid {
 
@@ -48,6 +49,10 @@ void ImageRendererES3::onNewFrame(const void *data, unsigned width, unsigned hei
 
     if (lastFrameSize.first != width || lastFrameSize.second != height) {
         glTexImage2D(GL_TEXTURE_2D, 0, glInternalFormat, width, height, 0, glFormat, glType, data);
+        GLenum textureError = glGetError();
+        if (textureError != GL_NO_ERROR) {
+            LOGE("OpenGL error uploading ES3 frame: 0x%x", textureError);
+        }
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, glFormat, glType, data);
     }

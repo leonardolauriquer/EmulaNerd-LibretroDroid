@@ -125,6 +125,10 @@ void Video::updateProgram() {
     gFlipYHandle = glGetUniformLocation(gProgram, "vFlipY");
 
     gViewModelMatrixHandle = glGetUniformLocation(gProgram, "vViewModel");
+
+    LOGI("OpenGL program=%u attrs=(%d,%d) uniforms=(texture=%d,size=%d,density=%d,flip=%d,matrix=%d)",
+         gProgram, gvPositionHandle, gvCoordinateHandle, gTextureHandle,
+         gTextureSizeHandle, gScreenDensityHandle, gFlipYHandle, gViewModelMatrixHandle);
 }
 
 void Video::renderFrame() {
@@ -167,6 +171,11 @@ void Video::renderFrame() {
     glUniformMatrix4fv(gViewModelMatrixHandle, 1, false, gViewModelMatrix);
 
     glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    GLenum renderError = glGetError();
+    if (renderError != GL_NO_ERROR) {
+        LOGE("OpenGL error after rendering frame: 0x%x", renderError);
+    }
 
     glDisableVertexAttribArray(gvPositionHandle);
     glDisableVertexAttribArray(gvCoordinateHandle);

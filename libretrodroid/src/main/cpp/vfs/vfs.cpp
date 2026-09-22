@@ -32,7 +32,6 @@ const char *VFS::path(struct retro_vfs_file_handle* stream) {
 }
 
 struct retro_vfs_file_handle* VFS::open(const char* path, unsigned int mode, unsigned int hints) {
-    LOGV("VFS Calling open: %s %i", path, mode);
     auto result = VFS::getInstance().virtualOpen(path, mode, hints);
     if (result != nullptr) {
         return result;
@@ -120,25 +119,30 @@ void VFS::deinitialize() {
 }
 
 struct retro_vfs_file_handle* VFS::virtualOpen(const char *path, unsigned int mode, unsigned int hints) {
-    LOGV("VFS Calling open: %s %i", path, mode);
-
     VFSFile* virtualFile = findVirtualFile(path);
 
     if (virtualFile == nullptr) {
         return nullptr;
     }
 
-    LOGD("VFS Performing virtual file open: %s", virtualFile->getFileName().data());
-
     auto stream = new retro_vfs_file_handle;
 
     int duplicateFD = dup(virtualFile->getFD());
     FILE* file = fdopen(duplicateFD, "rb");
+    if (file == nullptr) {
+        ::close(duplicateFD);
+        delete stream;
+        return nullptr;
+    }
     size_t size = Utils::getFileSize(file);
 
-    LOGV("VFS Virtual file size: %i", size);
-
-    stream->fd = duplicateFD;
+    // fdopen() transfers ownership of duplicateFD to FILE*. The generic
+    // libretro VFS close path calls fclose(stream->fp) and then close(fd)
+    // when fd is populated; keeping the same descriptor in both fields
+    // triggers Android fdsan (double-close: FILE* owns the descriptor).
+    // Buffered virtual files are operated through fp, so the fd slot must
+    // remain unused and the FILE* is the sole owner.
+    stream->fd = -1;
     stream->hints = hints;
     stream->size = size;
     stream->buf = nullptr;
