@@ -35,6 +35,7 @@ import com.swordfish.libretrodroid.KtUtils.awaitUninterruptibly
 import com.swordfish.libretrodroid.gamepad.GamepadsManager
 import java.util.*
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.properties.Delegates
@@ -68,13 +69,18 @@ class GLRetroView(
     private val openGLESVersion: Int
 
     private var isGameLoaded = false
-    private var isEmulationReady = false
     private var isAborted = false
 
     private val retroGLEventsSubject = MutableSharedFlow<GLRetroEvents>(1)
     private val retroGLIssuesErrors = MutableSharedFlow<Int>(1)
 
     private val rumbleEventsSubject = MutableSharedFlow<RumbleEvent>()
+    private val firstFrameCallbacks = mutableListOf<Runnable>()
+    @Volatile private var firstFrameRendered = false
+    @Volatile private var isEmulationReady = false
+    private var isCoreCreated = false
+    private var isCoreResumed = false
+    private var isCoreDestroyed = false
 
     private var lifecycle: Lifecycle? = null
 
@@ -102,27 +108,90 @@ class GLRetroView(
     fun onCreate(lifecycleOwner: LifecycleOwner) = catchExceptions {
         Log.i(TAG_LOG, "Libretro lifecycle ON_CREATE")
         lifecycle = lifecycleOwner.lifecycle
-        LibretroDroid.create(
-            openGLESVersion,
-            data.coreFilePath,
-            data.systemDirectory,
-            data.savesDirectory,
-            data.variables,
-            buildShader(data.shader),
-            getDefaultRefreshRate(),
-            data.preferLowLatencyAudio,
-            data.gameVirtualFiles.isNotEmpty(),
-            data.skipDuplicateFrames,
-            getDeviceLanguage()
-        )
-        LibretroDroid.setRumbleEnabled(data.rumbleEventsEnabled)
+        val previousOwner = synchronized(coreLock) { nativeOwner }
+        if (previousOwner != null && previousOwner !== this) {
+            // LibretroDroid owns one process-wide native core. A replacement
+            // view must stop the previous GL thread before create() resets the
+            // singleton pointers; task replacement can overlap Activity lifecycles.
+            previousOwner.isEmulationReady = false
+            previousOwner.onPause()
+            synchronized(coreLock) {
+                if (nativeOwner === previousOwner && previousOwner.isCoreCreated
+                    && !previousOwner.isCoreDestroyed) {
+                    if (previousOwner.isCoreResumed) {
+                        LibretroDroid.pause()
+                        previousOwner.isCoreResumed = false
+                    }
+                    previousOwner.isCoreDestroyed = true
+                    LibretroDroid.destroy()
+                    nativeOwner = null
+                }
+            }
+        }
+        synchronized(coreLock) {
+            check(nativeOwner == null || nativeOwner === this) {
+                "A different GLRetroView still owns the process-wide Libretro core"
+            }
+            LibretroDroid.create(
+                openGLESVersion,
+                data.coreFilePath,
+                data.systemDirectory,
+                data.savesDirectory,
+                data.variables,
+                buildShader(data.shader),
+                getDefaultRefreshRate(),
+                data.preferLowLatencyAudio,
+                data.gameVirtualFiles.isNotEmpty(),
+                data.skipDuplicateFrames,
+                getDeviceLanguage()
+            )
+            isCoreCreated = true
+            nativeOwner = this
+            LibretroDroid.setRumbleEnabled(data.rumbleEventsEnabled)
+        }
     }
 
     @OnLifecycleEvent(Lifecycle.Event.ON_DESTROY)
     fun onDestroy() = catchExceptions {
         Log.i(TAG_LOG, "Libretro lifecycle ON_DESTROY")
-        LibretroDroid.destroy()
+        isEmulationReady = false
+        val destroyOnGlThread = synchronized(coreLock) { isCoreResumed }
+        if (destroyOnGlThread) {
+            // The native core is a process-wide singleton and retro_run() is
+            // called by GLSurfaceView's render thread. Queue teardown behind
+            // the current frame so video callbacks cannot race native destroy.
+            val completed = CountDownLatch(1)
+            queueEvent {
+                try {
+                    destroyNativeCore()
+                } finally {
+                    completed.countDown()
+                }
+            }
+            if (!completed.await(2, TimeUnit.SECONDS)) {
+                Log.w(TAG_LOG, "GL thread did not acknowledge teardown; using serialized fallback")
+                destroyNativeCore()
+            }
+        } else {
+            // ON_PAUSE already stopped the renderer; the singleton is idle.
+            destroyNativeCore()
+        }
+        onPause()
         lifecycle = null
+    }
+
+    private fun destroyNativeCore() = synchronized(coreLock) {
+        if (nativeOwner !== this || !isCoreCreated || isCoreDestroyed) {
+            isCoreDestroyed = true
+            return@synchronized
+        }
+        if (isCoreResumed) {
+            LibretroDroid.pause()
+            isCoreResumed = false
+        }
+        isCoreDestroyed = true
+        LibretroDroid.destroy()
+        nativeOwner = null
     }
 
     private fun getDeviceLanguage() = Locale.getDefault().language
@@ -187,6 +256,27 @@ class GLRetroView(
 
     fun getGLRetroEvents(): Flow<GLRetroEvents> {
         return retroGLEventsSubject
+    }
+
+    /** Runs once the core advances its first frame, even if the listener subscribes later. */
+    fun onFirstFrame(callback: Runnable) {
+        val alreadyRendered: Boolean
+        synchronized(firstFrameCallbacks) {
+            alreadyRendered = firstFrameRendered
+            if (!alreadyRendered) firstFrameCallbacks.add(callback)
+        }
+        if (alreadyRendered) post { callback.run() }
+    }
+
+    private fun notifyFirstFrameRendered() {
+        val callbacks: List<Runnable>
+        synchronized(firstFrameCallbacks) {
+            if (firstFrameRendered) return
+            firstFrameRendered = true
+            callbacks = firstFrameCallbacks.toList()
+            firstFrameCallbacks.clear()
+        }
+        callbacks.forEach { callback -> post { callback.run() } }
     }
 
     fun getGLRetroErrors(): Flow<Int> {
@@ -296,17 +386,28 @@ class GLRetroView(
         @OnLifecycleEvent(Lifecycle.Event.ON_RESUME)
         private fun resume() = catchExceptions {
             Log.i(TAG_LOG, "Libretro lifecycle RESUME")
-            LibretroDroid.resume()
             onResume()
             refreshAspectRatio()
-            isEmulationReady = true
+            synchronized(coreLock) {
+                if (nativeOwner === this@GLRetroView && !isCoreDestroyed) {
+                    LibretroDroid.resume()
+                    isCoreResumed = true
+                    isEmulationReady = true
+                }
+            }
         }
 
         @OnLifecycleEvent(Lifecycle.Event.ON_PAUSE)
         private fun pause() = catchExceptions {
             isEmulationReady = false
             onPause()
-            LibretroDroid.pause()
+            synchronized(coreLock) {
+                if (nativeOwner === this@GLRetroView && isCoreCreated
+                    && !isCoreDestroyed && isCoreResumed) {
+                    LibretroDroid.pause()
+                    isCoreResumed = false
+                }
+            }
         }
     }
 
@@ -315,13 +416,23 @@ class GLRetroView(
 
         override fun onDrawFrame(gl: GL10) = catchExceptions {
             if (drawLogCount < 3) Log.i(TAG_LOG, "Libretro draw frame #${++drawLogCount} ready=$isEmulationReady")
-            if (isEmulationReady) {
-                if (!slowMotion) {
-                    LibretroDroid.step(this@GLRetroView)
-                } else {
-                    slowFrameToggle = !slowFrameToggle
-                    if (slowFrameToggle) LibretroDroid.step(this@GLRetroView)
+            var steppedCore = false
+            synchronized(coreLock) {
+                if (nativeOwner === this@GLRetroView && isEmulationReady && !isCoreDestroyed) {
+                    if (!slowMotion) {
+                        LibretroDroid.step(this@GLRetroView)
+                        steppedCore = true
+                    } else {
+                        slowFrameToggle = !slowFrameToggle
+                        if (slowFrameToggle) {
+                            LibretroDroid.step(this@GLRetroView)
+                            steppedCore = true
+                        }
+                    }
+                    if (steppedCore) notifyFirstFrameRendered()
                 }
+            }
+            if (steppedCore) {
                 lifecycle?.coroutineScope?.launch {
                     retroGLEventsSubject.emit(GLRetroEvents.FrameRendered)
                 }
@@ -331,16 +442,24 @@ class GLRetroView(
         override fun onSurfaceChanged(gl: GL10, width: Int, height: Int) = catchExceptions {
             Log.i(TAG_LOG, "Libretro surface changed ${width}x${height}")
             Thread.currentThread().priority = Thread.MAX_PRIORITY
-            LibretroDroid.onSurfaceChanged(width, height)
+            synchronized(coreLock) {
+                if (nativeOwner === this@GLRetroView && !isCoreDestroyed) {
+                    LibretroDroid.onSurfaceChanged(width, height)
+                }
+            }
         }
 
 
         override fun onSurfaceCreated(gl: GL10, config: EGLConfig) = catchExceptions {
             Log.i(TAG_LOG, "Libretro surface created")
             Thread.currentThread().priority = Thread.MAX_PRIORITY
-            initializeCore()
-            lifecycle?.coroutineScope?.launch {
-                retroGLEventsSubject.emit(GLRetroEvents.SurfaceCreated)
+            synchronized(coreLock) {
+                if (nativeOwner === this@GLRetroView && !isCoreDestroyed) initializeCore()
+            }
+            if (nativeOwner === this@GLRetroView && !isCoreDestroyed) {
+                lifecycle?.coroutineScope?.launch {
+                    retroGLEventsSubject.emit(GLRetroEvents.SurfaceCreated)
+                }
             }
         }
     }
@@ -464,6 +583,10 @@ class GLRetroView(
 
     companion object {
         private val TAG_LOG = GLRetroView::class.java.simpleName
+        // LibretroDroid is a process-wide singleton; every GLRetroView must
+        // serialize native calls and teardown against the same monitor.
+        private val coreLock = Any()
+        @Volatile private var nativeOwner: GLRetroView? = null
 
         const val MOTION_SOURCE_DPAD = LibretroDroid.MOTION_SOURCE_DPAD
         const val MOTION_SOURCE_ANALOG_LEFT = LibretroDroid.MOTION_SOURCE_ANALOG_LEFT
